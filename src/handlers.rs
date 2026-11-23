@@ -1,5 +1,5 @@
 use comfy_table::Table;
-use inquire::Text;
+use inquire::{CustomType, Text};
 use sqlx::{MySqlPool, Row};
 
 // ==========================================
@@ -8,9 +8,14 @@ use sqlx::{MySqlPool, Row};
 
 // View full catalog via vw_catalog
 pub async fn view_items(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Error>> {
-    let rows = sqlx::query("SELECT * FROM vw_catalog ORDER BY itemID ASC LIMIT 25")
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT itemID, item_title, type_name, genre_name, section, copies 
+         FROM vw_catalog 
+         ORDER BY itemID ASC 
+         LIMIT 25",
+    )
+    .fetch_all(pool)
+    .await?;
 
     let mut table = Table::new();
     table.set_header(vec!["Item ID", "Title", "Type", "Genre", "Section", "Copies"]);
@@ -20,7 +25,7 @@ pub async fn view_items(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Erro
         let title: String = row.try_get("item_title")?;
         let type_name: String = row.try_get("type_name")?;
         let genre_name: String = row.try_get("genre_name")?;
-        let section: String = row.try_get("section")?;
+        let section: Option<String> = row.try_get("section")?;
         let copies: i32 = row.try_get("copies")?;
 
         table.add_row(vec![
@@ -28,7 +33,7 @@ pub async fn view_items(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Erro
             title,
             type_name,
             genre_name,
-            section,
+            section.unwrap_or_else(|| "N/A".to_string()),
             copies.to_string(),
         ]);
     }
@@ -40,10 +45,18 @@ pub async fn view_items(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Erro
 // Search catalog by keyword via vw_catalog
 pub async fn search_items(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Error>> {
     let keyword = Text::new("Search item title:").prompt()?;
-    let pattern = format!("%{}%", keyword.trim());
+    let escaped = keyword
+        .trim()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
 
     let rows = sqlx::query(
-        "SELECT itemID, item_title, type_name, copies FROM vw_catalog WHERE item_title LIKE ?",
+        "SELECT itemID, item_title, type_name, copies 
+         FROM vw_catalog 
+         WHERE item_title LIKE ? 
+         LIMIT 25",
     )
     .bind(pattern)
     .fetch_all(pool)
@@ -103,9 +116,21 @@ pub async fn view_members(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Er
 
 // View active checkouts via vw_active_checkouts
 pub async fn view_active_checkouts(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Error>> {
-    let rows = sqlx::query("SELECT * FROM vw_active_checkouts ORDER BY due_date ASC")
-        .fetch_all(pool)
-        .await?;
+    let query = "
+        SELECT 
+            checkoutID,
+            itemID,
+            item_title,
+            memberID,
+            member_name,
+            DATE_FORMAT(checkout_date, '%Y-%m-%d') AS checkout_date,
+            DATE_FORMAT(due_date, '%Y-%m-%d') AS due_date
+        FROM vw_active_checkouts 
+        ORDER BY due_date ASC
+        LIMIT 25
+    ";
+
+    let rows = sqlx::query(query).fetch_all(pool).await?;
 
     let mut table = Table::new();
     table.set_header(vec![
@@ -140,52 +165,38 @@ pub async fn view_active_checkouts(pool: &MySqlPool) -> Result<(), Box<dyn std::
 
 // Check out an item via Checkout_Item(membernum, itemnum)
 pub async fn checkout_item(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Error>> {
-    let member_id: i32 = Text::new("Enter Member ID:").prompt()?.trim().parse()?;
-    let item_id: i32 = Text::new("Enter Item ID:").prompt()?.trim().parse()?;
+    let member_id = CustomType::<i32>::new("Enter Member ID:")
+        .with_error_message("Please enter a valid numeric Member ID")
+        .prompt()?;
+    let item_id = CustomType::<i32>::new("Enter Item ID:")
+        .with_error_message("Please enter a valid numeric Item ID")
+        .prompt()?;
 
-    match sqlx::query("CALL Checkout_Item(?, ?)")
+    let row = sqlx::query("CALL Checkout_Item(?, ?)")
         .bind(member_id)
         .bind(item_id)
-        .execute(pool)
-        .await
-    {
-        Ok(res) => {
-            if res.rows_affected() > 0 {
-                println!("\nSuccess: Item #{item_id} checked out to Member #{member_id}.\n");
-            } else {
-                println!("\nBlocked: No copies available or invalid Item ID.\n");
-            }
-        }
-        Err(sqlx::Error::Database(db_err)) => {
-            println!("\nDatabase error: {}\n", db_err.message());
-        }
-        Err(e) => return Err(e.into()),
-    }
+        .fetch_one(pool)
+        .await?;
+
+    let msg: String = row.try_get("status_msg")?;
+    println!("\n{msg}\n");
 
     Ok(())
 }
 
 // Check in an item via Checkin_Item(itemnum)
 pub async fn checkin_item(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Error>> {
-    let item_id: i32 = Text::new("Enter Item ID to check in:").prompt()?.trim().parse()?;
+    let item_id = CustomType::<i32>::new("Enter Item ID to check in:")
+        .with_error_message("Please enter a valid numeric Item ID")
+        .prompt()?;
 
-    match sqlx::query("CALL Checkin_Item(?)")
+    let row = sqlx::query("CALL Checkin_Item(?)")
         .bind(item_id)
-        .execute(pool)
-        .await
-    {
-        Ok(res) => {
-            if res.rows_affected() > 0 {
-                println!("\nSuccess: Item #{item_id} checked in.\n");
-            } else {
-                println!("\nNotice: No active checkout found for Item #{item_id}.\n");
-            }
-        }
-        Err(sqlx::Error::Database(db_err)) => {
-            println!("\nDatabase error: {}\n", db_err.message());
-        }
-        Err(e) => return Err(e.into()),
-    }
+        .fetch_one(pool)
+        .await?;
+
+    let msg: String = row.try_get("status_msg")?;
+    println!("\n{msg}\n");
 
     Ok(())
 }
@@ -197,7 +208,9 @@ pub async fn checkin_item(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Er
 // View study rooms and amenities
 pub async fn view_rooms(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Error>> {
     let rows = sqlx::query(
-        "SELECT roomID, room_name, capacity, has_whiteboard, has_projector FROM study_room",
+        "SELECT roomID, room_name, capacity, has_whiteboard, has_projector 
+         FROM study_room 
+         ORDER BY roomID ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -227,9 +240,21 @@ pub async fn view_rooms(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Erro
 
 // View room bookings via vw_room_bookings
 pub async fn view_room_bookings(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Error>> {
-    let rows = sqlx::query("SELECT * FROM vw_room_bookings ORDER BY booking_date DESC, start_time ASC")
-        .fetch_all(pool)
-        .await?;
+    let query = "
+        SELECT 
+            bookingID,
+            room_name,
+            member_name,
+            DATE_FORMAT(booking_date, '%Y-%m-%d') AS booking_date,
+            TIME_FORMAT(start_time, '%H:%i:%s') AS start_time,
+            TIME_FORMAT(end_time, '%H:%i:%s') AS end_time,
+            booking_status
+        FROM vw_room_bookings 
+        ORDER BY booking_date DESC, start_time ASC
+        LIMIT 25
+    ";
+
+    let rows = sqlx::query(query).fetch_all(pool).await?;
 
     let mut table = Table::new();
     table.set_header(vec![
@@ -260,33 +285,29 @@ pub async fn view_room_bookings(pool: &MySqlPool) -> Result<(), Box<dyn std::err
 
 // Book a study room via Book_Room(memberID, room, date, time, people)
 pub async fn book_room(pool: &MySqlPool) -> Result<(), Box<dyn std::error::Error>> {
-    let member_id: i32 = Text::new("Enter Member ID:").prompt()?.trim().parse()?;
-    let room_id: i32 = Text::new("Enter Study Room ID:").prompt()?.trim().parse()?;
+    let member_id = CustomType::<i32>::new("Enter Member ID:")
+        .with_error_message("Please enter a valid numeric Member ID")
+        .prompt()?;
+    let room_id = CustomType::<i32>::new("Enter Study Room ID:")
+        .with_error_message("Please enter a valid numeric Room ID")
+        .prompt()?;
     let date = Text::new("Enter Date (YYYY-MM-DD):").prompt()?.trim().to_string();
     let time = Text::new("Enter Start Time (HH:MM:SS):").prompt()?.trim().to_string();
-    let people: i32 = Text::new("Number of people:").prompt()?.trim().parse()?;
+    let people = CustomType::<i32>::new("Number of people:")
+        .with_error_message("Please enter a valid number of people")
+        .prompt()?;
 
-    match sqlx::query("CALL Book_Room(?, ?, ?, ?, ?)")
+    let row = sqlx::query("CALL Book_Room(?, ?, ?, ?, ?)")
         .bind(member_id)
         .bind(room_id)
         .bind(&date)
         .bind(&time)
         .bind(people)
-        .execute(pool)
-        .await
-    {
-        Ok(res) => {
-            if res.rows_affected() > 0 {
-                println!("\nSuccess: Room #{room_id} booked on {date} at {time}.\n");
-            } else {
-                println!("\nBlocked: Party size ({people}) exceeds capacity or invalid Room ID.\n");
-            }
-        }
-        Err(sqlx::Error::Database(db_err)) => {
-            println!("\nDatabase error: {}\n", db_err.message());
-        }
-        Err(e) => return Err(e.into()),
-    }
+        .fetch_one(pool)
+        .await?;
+
+    let msg: String = row.try_get("status_msg")?;
+    println!("\n{msg}\n");
 
     Ok(())
 }
